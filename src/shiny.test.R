@@ -3,73 +3,109 @@ library(dplyr)
 library(igraph)
 library(RColorBrewer)
 library(karyoploteR)
+library(gplots)
 
 setwd("/imppc/labs/mplab/share/metallopeptidases/")
-load("data/pantherdb.rda",verbose = T)
+load("data/pantherdb.rda",v=T)
 load("data/regions.rda",v=T)
+load("data/probeInfo.rda",v=T)
 
-geneToProbe$ROIType <- substr(geneToProbe$ROI,1,3)
+cancers <- c("CRC","BRCA","LUAD")
+
+geneToProbe$ROIType <- factor(substr(geneToProbe$ROI,1,3),c("TSS","CGI","SHO"))
+ROIcolors <- c("lightblue","red","orange")
+
+x <- sapply(unique(geneToProbe$ROI), function(x) strsplit(x,split="(-|:)")[[1]][3:4] %>% as.numeric) %>% t
+geneToProbe$ROIstart <- x[geneToProbe$ROI,1]
+geneToProbe$ROIend <- x[geneToProbe$ROI,2]
+rm(x)
+
 famCol <- rep(RColorBrewer::brewer.pal(9,"Pastel1"),10)
+rfl <- removeFirstLast <- function(x) x[-c(1,length(x))]
 
 
 # SHINY LAYOUT ----
 
 ui <- fluidPage(
-  tabsetPanel(
-    
-    tabPanel("Cancer Type", 
-             selectInput("cancerType","Cancer Type",choices = cancers,selected = "CRC")),
-    
-    tabPanel("Genes and Families", {
-      fluidRow(
-        
-        column(width = 3,
-               textAreaInput("genes","Genes",height = "500px",resize="none"),
-               column(width = 6, actionButton("toFamilies","To Families")),
-               column(width = 6, actionButton("clearGenes","Clear"))
-        ),
-        
-        column(width = 3,
-               textAreaInput("families","Gene Family",height = "500px",resize="none"),
-               column(width = 6,actionButton("toGenes","To Genes")),
-               column(width = 6,actionButton("clearFamilies","Clear"))
-        ),
-        
-        column(width = 6,
-               textAreaInput("familyNames","Family Name",height = "500px",resize="none"))
-      )
-    }),
-    
-    tabPanel("ROIS", {
-      sidebarLayout(
-        sidebarPanel(width = 3,
-               checkboxGroupInput("ROITypes",label = "ROI Type",
-                           choiceNames = list("TSS","CGI","Shores"),
-                           choiceValues = list("TSS","CGI","SHO"),
-                           selected = list("TSS","CGI")),
-        
-        actionButton("updateROIS","Update ROIS")),
-        
-        mainPanel(width = 9,
-               plotOutput("grois",height="800px",width="1000px"))
-        
-      )}),
-    
-    tabPanel("Genes on Karyotype",
-             plotOutput("gkaryo",width="800px",height="800px")),
-  
-    
-    tabPanel("Somatic alterations",
-             plotOutput("gsom",width="800px",height="800px")),
-    
-    tabPanel("Correlation graph A",
-             plotOutput("gcorA")),
-    
-    tabPanel("Correlation graph B",
-             plotOutput("gcorB"))
-    
+  tabsetPanel(id = "tabs",
+              
+              tabPanel("Cancer Type", 
+                       selectInput("cancerType","Cancer Type",choices = cancers,selected = "CRC")),
+              
+              tabPanel("Genes and Families", 
+                       fluidRow(
+                         
+                         column(width = 3,
+                                textAreaInput("genes","Genes",height = "500px",resize="none"),
+                                actionButton("toFamilies","To Families"),
+                                actionButton("clearGenes","Clear")
+                         ),
+                         
+                         column(width = 3,
+                                textAreaInput("families","Gene Family",height = "500px",resize="none"),
+                                actionButton("toGenes","To Genes"),
+                                actionButton("removeSF","Remove SubFamilies"),
+                                actionButton("clearFamilies","Clear")
+                         ),
+                         
+                         column(width = 6,
+                                textAreaInput("familyNames","Family Name",height = "500px",resize="none"))
+                       )
+              ),
+              
+              
+              tabPanel("Genes on Karyotype",
+                       plotOutput("karyotype",width="1200px",height="900px")),
+              
+              tabPanel("ROIs", 
+                       sidebarLayout(
+                         sidebarPanel(width = 3,
+                                      checkboxGroupInput("ROITypes",label = "ROI Type",
+                                                         choiceNames = list("TSS","CGI","Shores"),
+                                                         choiceValues = list("TSS","CGI","SHO"),
+                                                         selected = list("TSS","CGI")),
+                                      
+                                      actionButton("updateROIs","Update ROIS")),
+                         
+                         mainPanel(width = 9,
+                                   plotOutput("grois",height="800px",width="1000px"))
+                         
+                       )),
+              
+              tabPanel("ROIs Location", 
+                       sidebarLayout(
+                         
+                         sidebarPanel(width = 3,
+                                      selectInput("selectedGene","GENE",choices = "NONE",multiple = F)),
+                         
+                         mainPanel(width = 9,
+                                   plotOutput("roisPlot",width = "1000px",height = "400px"))
+                         
+                         
+                       )
+              ),
+              
+              
+              tabPanel("Somatic alterations",
+                       sidebarLayout(
+                         sidebarPanel(width = 2,
+                                      sliderInput("somaticBins","Number of Bins",3,51,15,step = 2),
+                                      sliderInput("selThreshold","Selection Threshold",0,.8,0,step=.05)),
+                         
+                         mainPanel(width = 10,
+                                   plotOutput("gsom",width="1400px",height="1000px"))
+                         
+                       )),
+              
+              tabPanel("Correlation graph A",
+                       plotOutput("corplot1",width="1400px",height="1000px")),
+              
+              
+              tabPanel("Correlation graph B",
+                       plotOutput("corplot2",width="1400px",height="1000px"))
+              
   ))
-  
+
 
 
 # SHINY SERVER -------
@@ -77,16 +113,67 @@ ui <- fluidPage(
 
 server <- function(input,output,session) {
   
+  # color palettes
+  
+  somaticPalette <- colorRampPalette(c("darkblue","white","darkred"))
+  correlationPalette <- colorRampPalette(c("orange4","white","darkgreen"))
+  somaticRamp <- colorRamp(c("darkblue","white","darkred"))
+  correlationRamp <- colorRamp(c("orange4","white","darkgreen"))
+  
+  
+  
+  # select the cancer type
+  
+  methylationdir <- "/imppc/labs/mplab/share/ICGC/"
+  cancerData <- reactive({
+    cancer <- input$cancerType
+    somatic <- readRDS(sprintf("%s/%s/methICGC/somaticROI.rds",methylationdir,cancer))
+    tumors <- substring(colnames(somatic,14,15)) == "01"
+    cgimeth <- colMeans(somatic[substr(rownames(somatic),1,3)=="CGI",tumors],na.rm=T)
+    cat("updated cancer data\n")
+    return(somatic=somatic,tumors=tumors,cgimeth=cgimeth)
+  })
+ 
+ 
+  # rois is the main data frame where the genes, mirnas, probes, etc are stored
+  
+  rois <- reactive({
+    genes <- readInput(input$genes)
+    ROITypes <- input$ROITypes
+    
+    rois <- subset(geneToProbe,hgnc_symbol %in% genes & ROIType %in% ROITypes) # this is the main information table
+    nameLength <- nchar(rois$ROI) + nchar(rois$hgnc_symbol)
+    rois$longName <- sprintf("%s%s%s",rois$ROI,strrep(".",max(nameLength)-nameLength+2),rois$hgnc_symbol)
+    
+    cat("updated rois\n")
+    return(rois)
+    
+  })
+  
+ 
+  somatic <- reactive({
+    cancerData <- cancerData()
+    rois <- rois()
+    somatic <- cancerData$somatic[intersect(rownames(cancerData$somatic),rois$ROI),cancerData$tumors]
+
+    selected <- rowSums(abs(somatic) > input$selThreshold) >= sum(tumors)*.05
+    cat("updated somatic data\n")
+    return(somatic[selected,])
+    
+  })
   
   
   observeEvent(input$toGenes,{
-    families <- strsplit(input$families,split="(\n|,)")[[1]] %>% gsub(" +","",.)
-    familyNames <- paste(families,panther2[families,"name"],sep=": ")
+    families <- readInput(input$families)
     genes <- familyToGene(families)
-    
-    updateTextAreaInput(session,"genes",value=paste(genes,collapse="\n"))
-    updateTextAreaInput(session,"familyNames",value=paste(familyNames,collapse="\n\n"))
-    
+    updateGenesAndFamilies(genes,families,session)
+  })
+  
+  observeEvent(input$removeSF, {
+    families <- readInput(input$families)
+    families <- families[!grepl(":SF",families)]
+    genes <- readInput(input$genes)
+    updateGenesAndFamilies(genes,families,session)
   })
   
   observeEvent(input$clearFamilies,{
@@ -95,66 +182,67 @@ server <- function(input,output,session) {
   })
   
   observeEvent(input$toFamilies,{
-    genelist <- strsplit(input$genes,split="(\n|,)")[[1]] %>% gsub(" +","",.)
-    families <- geneToFamily(genelist)
-    familyNames <- paste(families,panther2[families,"name"],sep=": ")
-    
-    updateTextAreaInput(session,"families",value=paste(families,collapse="\n"))
-    updateTextAreaInput(session,"familyNames",value=paste(familyNames,collapse="\n\n"))
-    
+    genes <- readInput(input$genes)
+    families <- geneToFamily(genes)
+    updateGenesAndFamilies(genes,families,session)
   })
   
-  observeEvent(input$clearGenes,
-               updateTextAreaInput(session,"genes",value=""))
+  observeEvent(input$clearGenes,{
+    updateTextAreaInput(session,"genes",value="")
+  })
   
   
-  observeEvent(input$updateROIS, {
-    
-    # Select ROIS from genes
-    
-    families <- strsplit(input$families,split="(\n|,)")[[1]] %>% gsub(" +","",.)
-    families <- families[families != ""]
-    # families <- families[families %in% panther$hmmpanther] # remove families not listed in panther
-    
-    genes <- strsplit(input$genes,split="(\n|,)")[[1]] %>% gsub(" +","",.)
-    # genes <- genes[genes %in% panther$hmmpanther] # remove genes not listed in panther
-    
-    ROITypes <- input$ROITypes
-    
-    rois <- subset(geneToProbe,hgnc_symbol %in% genes & ROIType %in% ROITypes)
-    
-    nmax <- sapply(list(families,genes,rois$ROI), function(x) length(unique(x))) %>% max
-    
+  observeEvent(input$updateROIs, {
+    families <- readInput(input$families)
+    nmax <- sapply(list(families,genes,rois()$ROI), function(x) length(unique(x))) %>% max
     output$grois <- renderPlot(
       height = 800+(nmax-20)*10,
-      expr = roisGraph(families,genes,ROITypes) 
+      expr = roisGraph(rois(),families) 
     )
-    
-     output$gkaryo <- renderPlot(
-       expr = {
-        kp <- plotKaryotype()
-        rois2 <- rois[,c("hgnc_symbol","ROI","chr")] %>% unique
-        rois2$center <- sapply(strsplit(rois2$ROI,split="[:-]"),function(x) as.numeric(x[3:4]) %>% mean)
-        kpPlotMarkers(kp,chr=rois2$chr,x=rois2$center,y=.1,labels = rois2$hgnc_symbol,cex=1,srt=45)
-       }
-     )
-    
   })
+  
+  
+  # plot the graphs
+  
+  output$karyotype <- renderPlot(mapgenes(readInput(input$genes)))
+  output$roisPlot <- renderPlot(mapROIs(input$selectedGene,rois()))
+  output$gsom <- renderPlot(plotSomatic(somatic(),cancerData()$cgimeth,input$somaticBins))
+  
   
 }
 
 
-# Functions to be run on the Shiny Server
+# Functions to be run on the Shiny Server ----
 
+readInput <- function(inputId) {
+  x <- strsplit(inputId,split="(\n|,)")[[1]] %>% gsub(" +","",.)
+  x[x!=""]
+}
+
+updateGenesAndFamilies <- function(genes,families,session) {
+  familyNames <- paste(families,panther2[families,"name"],sep=": ")
+  updateTextAreaInput(session,"genes",value=paste(genes,collapse="\n"))
+  updateTextAreaInput(session,"families",value=paste(families,collapse="\n"))
+  updateTextAreaInput(session,"familyNames",value=paste(familyNames,collapse="\n\n"))
+  updateSelectInput(session = session,inputId = "selectedGene",choices=genes)
+}
+
+updateROIs <- function(genes,ROITypes) {
+  rois <- subset(geneToProbe,hgnc_symbol %in% genes & ROIType %in% ROITypes) # this is the main information table
+  nameLength <- nchar(rois$ROI) + nchar(rois$hgnc_symbol)
+  rois$longName <- sprintf("%s%s%s",rois$ROI,strrep(".",max(nameLength)-nameLength+2),rois$hgnc_symbol)
+  return(rois)
+}
 
 # Graph showing the families, genes and ROIs ----
 
-roisGraph <- function(families,genes,ROITypes) {
-  rois <- subset(geneToProbe,hgnc_symbol %in% genes & ROIType %in% ROITypes)
-  rois <- rois[,c("hgnc_symbol","ensembl_transcript_id","ROI","chr")]
+roisGraph <- function(rois,families) {
+  
+  
+  print(colnames(rois))
+  rois <- rois[,c("hgnc_symbol","ensembl_transcript_id","ROI","chr","longName")]
   rois <- unique(rois)
-  rois$center <- sapply(strsplit(rois$ROI,split="(:|-)"),function(x) mean(as.numeric(x[3:4])))
-
+  
   # add columns with family information
   # one column per family, with T or F
   
@@ -173,11 +261,11 @@ roisGraph <- function(families,genes,ROITypes) {
   
   rois$order <- o2[rois$hgnc_symbol]
   rois <- rois[order(rois$order,rois$hgnc_symbol),] # order ROIs according to the gene family
-
+  
   m <- c(families=list(rownames(m2)),apply(rois,2,unique))
   m$type <- factor(substr(m$ROI,1,3),c("TSS","CGI","SHO"))
   n <- sapply(m,length)
-
+  
   plot.new()
   
   x0 <- min(0,(10-ncol(m2))/10)
@@ -220,13 +308,123 @@ roisGraph <- function(families,genes,ROITypes) {
     segments(3+w[3],y[[3]][sel],4-w[4],y[[4]][i])
   }
   
-
+  
 }
 
-# Somatic alterations -----
+# map genes on Karyotype
+
+mapgenes <- function(genes) {
+  enst <- subset(ENST,hgnc_symbol %in% genes)
+  tss <- ifelse(strand(enst)=="+",start(enst),end(enst))
+  minTSS <- tapply(tss,enst$hgnc_symbol,min)
+  maxTSS <- tapply(tss,enst$hgnc_symbol,max)
+  chr <- tapply(as.character(seqnames(enst)),enst$hgnc_symbol,unique)
+  
+  kp <- plotKaryotype()
+  if(length(genes) > 0) {
+    kpPlotMarkers(kp,chr=chr,x=(minTSS+maxTSS)/2,labels=names(minTSS),text.orientation = "hor",y=.5,cex=.8)
+  }
+  
+}
 
 
+# Individual plots of the loctaion of the ROIs
 
+mapROIs <- function(gene,rois) {
+  x <- subset(rois,hgnc_symbol == gene)
+  ensts <- ENST[unique(x$ensembl_transcript_id)]
+  region <- range(ensts) + 5000
+  geneStartEnd <- range(c(start(ensts),end(ensts)))
+  geneLength <- diff(geneStartEnd)
+  strand <- ifelse(unique(strand(ensts))=="+",1,-1)
+  geneStart <- ifelse(strand == 1,geneStartEnd[1],geneStartEnd[2])
+  
+  
+  plot(NA,xlim=c(start(region),end(region)),ylim=c(0.5,3.5),
+       yaxt="n",
+       xlab=sprintf("%s:%i-%i",unique(x$chr),start(region),end(region)),
+       ylab="")
+  rect(geneStart,1,geneStart + strand * geneLength*.91,1.2,border=NA,col="lightblue")
+  polygon(geneStart + strand * geneLength * c(.9,1,.9),c(.95,1.1,1.25),border=NA,col="lightblue")
+  
+  text(mean(geneStartEnd),1,sprintf(ifelse(geneLength < 1e6,sprintf("%1.1f Kb",geneLength/1000),sprintf("%1.1f Gb",geneLength/1e6))),pos=1)
+  text(mean(geneStartEnd),1.1,gene,font=3)
+  y.ensts <- removeFirstLast(seq(1.2,2.5,l=length(ensts)+2))
+  
+  ensts.start <- ifelse(strand(ensts)=="+",start(ensts),end(ensts))
+  ensts.stop <- ifelse(strand(ensts)=="+",end(ensts),start(ensts))
+  
+  segments(ensts.start-PROMOTERWIDTH/2,y.ensts,ensts.start+PROMOTERWIDTH/2,y.ensts,lwd=6,col="grey")
+  segments(ensts.start,y.ensts,ensts.stop,y.ensts,lty=ifelse(ensts$transcript_tsl=="tsl1",1,2))
+  points(ensts.start,y.ensts,pch=21,bg="green")
+  points(ensts.stop,y.ensts,pch=21,bg="red")
+  
+  cgis <- CGI[findOverlaps(CGI,region)@from]
+  if(length(cgis) > 0) rect(start(cgis),2.5,end(cgis),2.7,col="pink",border="pink")
+  
+  probes <- probeInfo[findOverlaps(probeInfo,region,ignore.strand=T)@from]
+  segments(start(probes),2.8,end(probes),2.9)
+  
+  rect(start(region)-6000,3-.05,end(region)+6000,3.3+.05,col="lightgrey",border=NA)
+  y <- unique(x[,c("ROI","ROIType")])
+  rois0 <- ROI[as.character(unique(x$ROI))]
+  rect(start(rois0),3,end(rois0),3.3,col=ROIcolors[y$ROIType])
+  
+  
+}
+
+
+#### SOMATIC CHANGES #####
+
+plotSomatic <- function(somatic,cgimeth,nbins) {
+  
+  roimeth <- colMeans(somatic,na.rm=T) # methylation in ROIs
+  corGlobal <- cor(cgimeth,t(somatic),use="complete")
+  orderROIs <-order(rowMeans(somatic,na.rm=T))
+  ordertumors <- order(cgimeth) 
+  
+  par(family="mono",font=1)
+  
+  
+  
+  tumorColor <- somaticRamp(cgimeth/max(abs(cgimeth))/2 + .5)/255 
+  tumorColor <- apply(tumorColor,1,function(x) rgb(x[1],x[2],x[3]))
+  tumorColor <- tumorColor
+  
+  roiColor <- correlationRamp(corGlobal/2 + .5) / 255
+  roiColor <- apply(roiColor,1,function(x) rgb(x[1],x[2],x[3]))
+  
+  longNames <- rois$longName
+  names(longNames) <- rois$ROI
+  labelcex <- min(.1 + 100/length(orderROIs),3)
+  
+  heatmap.2(somatic[orderROIs,ordertumors],trace="none",dendrogram = "none",
+            Colv = NULL,
+            Rowv = NA,
+            margins = c(5,75),
+            breaks=seq(-.9,.9,l=nbins+1),
+            col = somaticPalette(nbins),
+            labRow = longNames[rownames(somatic)][orderROIs],
+            colRow = NA,
+            labCol=NA,
+            keysize=1,
+            key.title = "Somatic alterations",
+            density.info="hist",
+            cexRow = labelcex,
+            cexCol = 1,
+            ColSideColors = tumorColor[ordertumors],
+            RowSideColors = roiColor[orderROIs])
+  
+}
+
+# Correlations graph ---------
+
+plotCorrelations <- function(cancerData,rois,selThreshold,cisThreshold) {
+  
+  
+  
+  
+}
 
 
 
