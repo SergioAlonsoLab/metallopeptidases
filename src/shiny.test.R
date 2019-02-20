@@ -4,6 +4,7 @@ library(igraph)
 library(RColorBrewer)
 library(karyoploteR)
 library(gplots)
+library(corrplot)
 
 setwd("/imppc/labs/mplab/share/metallopeptidases/")
 load("data/pantherdb.rda",v=T)
@@ -98,11 +99,28 @@ ui <- fluidPage(
                        )),
               
               tabPanel("Correlation graph A",
-                       plotOutput("corplot1",width="1400px",height="1000px")),
+                       sidebarLayout(
+                         sidebarPanel(width = 2,
+                                      numericInput("cisThreshold","cis Threshold",value = 1e6,min = 0, max = 1e9, step = 1000)),
+                         mainPanel(width = 10,
+                                   plotOutput("corplot1",width="1400px",height="1000px"))
+                       )),
+              
+              
+              
+              
+              
               
               
               tabPanel("Correlation graph B",
-                       plotOutput("corplot2",width="1400px",height="1000px"))
+                       sidebarLayout(
+                         sidebarPanel(width = 2,
+                                      sliderInput("clusterThreshold","Min corr cluster",value=0.25, min = 0,max = 1, step = 0.05),
+                                      textOutput("granularity")),
+                         mainPanel(width = 10,
+                                   plotOutput("corplot2",width="1400px",height="1000px"))
+                       ))
+              
               
   ))
 
@@ -128,13 +146,13 @@ server <- function(input,output,session) {
   cancerData <- reactive({
     cancer <- input$cancerType
     somatic <- readRDS(sprintf("%s/%s/methICGC/somaticROI.rds",methylationdir,cancer))
-    tumors <- substring(colnames(somatic,14,15)) == "01"
+    tumors <- substring(colnames(somatic),14,15) == "01"
     cgimeth <- colMeans(somatic[substr(rownames(somatic),1,3)=="CGI",tumors],na.rm=T)
     cat("updated cancer data\n")
-    return(somatic=somatic,tumors=tumors,cgimeth=cgimeth)
+    return(list(somatic=somatic,tumors=tumors,cgimeth=cgimeth))
   })
- 
- 
+  
+  
   # rois is the main data frame where the genes, mirnas, probes, etc are stored
   
   rois <- reactive({
@@ -150,17 +168,67 @@ server <- function(input,output,session) {
     
   })
   
- 
+  
   somatic <- reactive({
     cancerData <- cancerData()
     rois <- rois()
     somatic <- cancerData$somatic[intersect(rownames(cancerData$somatic),rois$ROI),cancerData$tumors]
-
+    
     selected <- rowSums(abs(somatic) > input$selThreshold) >= sum(tumors)*.05
     cat("updated somatic data\n")
     return(somatic[selected,])
     
   })
+  
+  
+  correlations <- reactive({
+    
+    somatic <- somatic()
+    rois <- rois()
+    cisThreshold <- input$cisThreshold
+    
+    longNames <- rois$longName
+    names(longNames) <- rois$ROI
+    
+    cor.x2 <- cor.x <- cor(t(somatic),use="complete")
+    
+    h1 <- hclust(as.dist(1 - cor.x),method = "complete")
+    d1 <- as.dendrogram(h1)
+    clusters <- cutree(h1,h = 1-.25)
+    
+    selectedROIs <- ROI[rownames(somatic)]
+    d <- sapply(1:length(selectedROIs),function(x) distance(selectedROIs[x],selectedROIs))
+    d[is.na(d)] <- cisThreshold + 1
+    
+    cor.x2[d < cisThreshold] <- NA
+    
+    cat("updated correlations\n")
+    
+    return(list(cor.x=cor.x,
+                cor.x2=cor.x2,
+                h1=h1,
+                d1=d1,
+                clusters=clusters,
+                longNames=longNames))
+    
+    
+  })
+  
+  
+  granularity <- reactive({
+    
+    with(correlations(),{
+      clusters <- cutree(h1,h = 1-input$clusterThreshold)
+      
+      nclusters <- nlevels(factor(clusters))
+      valid <- sum(!is.na(cor.x2))
+      inCluster <- sapply(1:nclusters,function(i) sum(!is.na(cor.x2[clusters==i,clusters==i]))) %>% sum
+      return(inCluster/valid)
+    })
+    
+    
+  })
+  
   
   
   observeEvent(input$toGenes,{
@@ -206,8 +274,10 @@ server <- function(input,output,session) {
   
   output$karyotype <- renderPlot(mapgenes(readInput(input$genes)))
   output$roisPlot <- renderPlot(mapROIs(input$selectedGene,rois()))
-  output$gsom <- renderPlot(plotSomatic(somatic(),cancerData()$cgimeth,input$somaticBins))
-  
+  output$gsom <- renderPlot(plotSomatic(somatic(),cancerData()$cgimeth,rois(),input$somaticBins))
+  output$corplot1 <- renderPlot(plotCorrelations(correlations()))
+  output$corplot2 <- renderPlot(plotCorrelations2(correlations(),input$clusterThreshold))
+  output$granularity <- renderText(sprintf("In clusters: %1.2f%%",granularity()*100))
   
 }
 
@@ -376,7 +446,7 @@ mapROIs <- function(gene,rois) {
 
 #### SOMATIC CHANGES #####
 
-plotSomatic <- function(somatic,cgimeth,nbins) {
+plotSomatic <- function(somatic,cgimeth,rois,nbins) {
   
   roimeth <- colMeans(somatic,na.rm=T) # methylation in ROIs
   corGlobal <- cor(cgimeth,t(somatic),use="complete")
@@ -384,8 +454,6 @@ plotSomatic <- function(somatic,cgimeth,nbins) {
   ordertumors <- order(cgimeth) 
   
   par(family="mono",font=1)
-  
-  
   
   tumorColor <- somaticRamp(cgimeth/max(abs(cgimeth))/2 + .5)/255 
   tumorColor <- apply(tumorColor,1,function(x) rgb(x[1],x[2],x[3]))
@@ -401,7 +469,7 @@ plotSomatic <- function(somatic,cgimeth,nbins) {
   heatmap.2(somatic[orderROIs,ordertumors],trace="none",dendrogram = "none",
             Colv = NULL,
             Rowv = NA,
-            margins = c(5,75),
+            margins = c(5,60),
             breaks=seq(-.9,.9,l=nbins+1),
             col = somaticPalette(nbins),
             labRow = longNames[rownames(somatic)][orderROIs],
@@ -410,21 +478,68 @@ plotSomatic <- function(somatic,cgimeth,nbins) {
             keysize=1,
             key.title = "Somatic alterations",
             density.info="hist",
-            cexRow = labelcex,
+            cexRow = max(2.5,.2 + 2.5/log10(nrow(somatic))),
             cexCol = 1,
             ColSideColors = tumorColor[ordertumors],
             RowSideColors = roiColor[orderROIs])
   
 }
 
-# Correlations graph ---------
+# Correlations graphs ---------
 
-plotCorrelations <- function(cancerData,rois,selThreshold,cisThreshold) {
+plotCorrelations <- function(correlations) {
+  par(family="mono",font=1)
   
-  
-  
+  with(correlations,{
+    
+    nclusters <- nlevels(factor(clusters))
+    clusterColors <- rainbow(n = nclusters,s = .3, v = 1)
+    
+    heatmap.2(cor.x2,trace="none",dendrogram = "both",
+              Colv = d1,
+              Rowv = rev(d1),
+              margins = c(5,60),
+              #breaks = seq(-1,1,l=21),
+              col = correlationPalette,
+              labRow = longNames[rownames(cor.x)],
+              labCol = NA,
+              key.title = "Correlation",
+              keysize=1.2,
+              density.info="h",
+              cexRow = max(2.5,.2 + 2.5/log10(nrow(cor.x2))),
+              #cexCol = 1,
+              ColSideColors = clusterColors[clusters],
+              RowSideColors = clusterColors[clusters],
+              na.color="grey50")
+  })
   
 }
+
+
+plotCorrelations2 <- function(correlations,clusterThreshold) {
+  par(family="mono",font=1)
+  
+  with(correlations,{
+    clusters <- cutree(h1,h = 1-clusterThreshold)
+    
+    nclusters <- nlevels(factor(clusters))
+    clusterColors <- rainbow(n = nclusters,s = .3, v = 1)
+    
+    o1 <- h1$order
+    rownames(cor.x2) <- longNames[rownames(cor.x2)]
+    corrplot(cor.x2[o1,o1],method="square",type="full",diag=T,col=correlationPalette,
+             tl.col="black",
+             na.label.col="black",na.label = "X",
+             mar=c(2,2,2,2))
+    
+    corrRect.hclust(cor.x,k=nclusters,method = "complete")
+    
+    
+    
+  })
+}
+
+# granularity value
 
 
 
